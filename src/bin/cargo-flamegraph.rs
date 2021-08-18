@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context};
-use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
+use cargo_metadata::{camino::Utf8PathBuf, Artifact, Message, MetadataCommand, Package};
 use structopt::StructOpt;
 
 use flamegraph::Workload;
@@ -100,51 +100,104 @@ enum Opts {
     Flamegraph(Opt),
 }
 
-fn build(opt: &Opt) -> anyhow::Result<Vec<Artifact>> {
+enum RequestedTarget {
+    Bin(String),
+    Example(String),
+    UnitTest(Option<String>),
+    Test(String),
+    Bench(String),
+    None,
+}
+
+impl RequestedTarget {
+    fn as_category(&self) -> Category {
+        match self {
+            Self::Bin(_) => Category::Bin,
+            Self::Example(_) => Category::Example,
+            Self::UnitTest(_) => Category::UnitTest,
+            Self::Test(_) => Category::Test,
+            Self::Bench(_) => Category::Bench,
+            Self::None => Category::Bin,
+        }
+    }
+}
+
+impl From<&Opt> for RequestedTarget {
+    fn from(value: &Opt) -> Self {
+        match value {
+            Opt { bin: Some(t), .. } => Self::Bin(t.clone()),
+            Opt {
+                example: Some(t), ..
+            } => Self::Example(t.clone()),
+            Opt { test: Some(t), .. } => Self::Test(t.clone()),
+            Opt { bench: Some(t), .. } => Self::Bench(t.clone()),
+            Opt {
+                unit_test: Some(t), ..
+            } => Self::UnitTest(t.clone()),
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Category {
+    Bin,
+    Example,
+    UnitTest,
+    Test,
+    Bench,
+}
+
+impl Category {
+    fn allows_kind(&self, kinds: &[String]) -> bool {
+        match self {
+            Self::Bin => kinds.iter().any(|k| k == "bin"),
+            Self::Example => kinds.iter().any(|k| k == "example"),
+            Self::UnitTest => kinds.iter().any(|k| k == "bin" || k == "lib"),
+            Self::Test => kinds.iter().any(|k| k == "test"),
+            Self::Bench => kinds.iter().any(|k| k == "bench"),
+        }
+    }
+}
+
+fn build(target: &ValidTarget, opt: &Opt) -> anyhow::Result<Utf8PathBuf> {
     use std::process::{Command, Output, Stdio};
     let mut cmd = Command::new("cargo");
 
-    // This will build benchmarks with the `bench` profile. This is needed
-    // because the `--profile` argument for `cargo build` is unstable.
-    if !opt.dev && opt.bench.is_some() {
-        cmd.args(&["bench", "--no-run"]);
-    } else {
-        cmd.arg("build");
+    match target.category {
+        Category::Bin => {
+            cmd.args(&["build", "--bin", &target.name]);
+        }
+        Category::Example => {
+            cmd.args(&["build", "--example", &target.name]);
+        }
+        Category::Test => {
+            cmd.args(&["build", "--test", &target.name]);
+        }
+        Category::UnitTest => {
+            // `cargo test` is required because `cargo build` does not have flags to build
+            // individual unit test targets. `cargo test` requires differentiating between lib and bin.
+            match target.kind.iter().any(|k| k == "lib") {
+                true => cmd.args(&["test", "--no-run", "--lib"]),
+                false => cmd.args(&["test", "--no-run", "--bin", &target.name]),
+            };
+        }
+        Category::Bench => {
+            // This will build benchmarks with the `bench` profile. This is needed
+            // because the `--profile` argument for `cargo build` is unstable.
+            match opt.dev {
+                true => cmd.args(&["build", "--bench", &target.name]),
+                false => cmd.args(&["bench", "--no-run", &target.name]),
+            };
+        }
     }
 
     // do not use `--release` when we are building for `bench`
-    if !opt.dev && opt.bench.is_none() {
+    if !opt.dev && target.category != Category::Bench {
         cmd.arg("--release");
     }
 
-    if let Some(ref package) = opt.package {
-        cmd.arg("--package");
-        cmd.arg(package);
-    }
-
-    if let Some(ref bin) = opt.bin {
-        cmd.arg("--bin");
-        cmd.arg(bin);
-    }
-
-    if let Some(ref example) = opt.example {
-        cmd.arg("--example");
-        cmd.arg(example);
-    }
-
-    if let Some(ref test) = opt.test {
-        cmd.arg("--test");
-        cmd.arg(test);
-    }
-
-    if let Some(ref bench) = opt.bench {
-        cmd.arg("--bench");
-        cmd.arg(bench);
-    }
-
-    if opt.unit_test.is_some() {
-        cmd.arg("--tests");
-    }
+    cmd.args(&["--package", &target.package]);
 
     if let Some(ref manifest_path) = opt.manifest_path {
         cmd.arg("--manifest-path");
@@ -175,35 +228,13 @@ fn build(opt: &Opt) -> anyhow::Result<Vec<Artifact>> {
         return Err(anyhow!("cargo build failed"));
     }
 
-    Message::parse_stream(&*stdout)
+    let artifacts: Vec<Artifact> = Message::parse_stream(&*stdout)
         .filter_map(|m| match m {
             Ok(Message::CompilerArtifact(artifact)) => Some(Ok(artifact)),
             Ok(_) => None,
             Err(e) => Some(Err(e).context("failed to parse cargo build output")),
         })
-        .collect()
-}
-
-fn workload(opt: &Opt, artifacts: &[Artifact]) -> anyhow::Result<Vec<String>> {
-    if artifacts.iter().all(|a| a.executable.is_none()) {
-        return Err(anyhow!(
-            "build artifacts do not contain any executable to profile"
-        ));
-    }
-
-    let (kind, target): (&[&str], _) = match opt {
-        Opt { bin: Some(t), .. } => (&["bin"], t),
-        Opt {
-            example: Some(t), ..
-        } => (&["example"], t),
-        Opt { test: Some(t), .. } => (&["test"], t),
-        Opt { bench: Some(t), .. } => (&["bench"], t),
-        Opt {
-            unit_test: Some(Some(t)),
-            ..
-        } => (&["lib", "bin"], t),
-        _ => return Err(anyhow!("no target for profiling")),
-    };
+        .collect::<anyhow::Result<_, _>>()?;
 
     // `target.kind` is a `Vec`, but it always seems to contain exactly one element.
     let (debug_level, binary_path) = artifacts
@@ -211,10 +242,7 @@ fn workload(opt: &Opt, artifacts: &[Artifact]) -> anyhow::Result<Vec<String>> {
         .find_map(|a| {
             a.executable
                 .as_deref()
-                .filter(|_| {
-                    a.target.name == *target
-                        && a.target.kind.iter().any(|k| kind.contains(&k.as_str()))
-                })
+                .filter(|_| a.target.name == target.name && a.target.kind == target.kind)
                 .map(|e| (a.profile.debuginfo, e))
         })
         .ok_or_else(|| {
@@ -224,7 +252,7 @@ fn workload(opt: &Opt, artifacts: &[Artifact]) -> anyhow::Result<Vec<String>> {
                 .collect();
             anyhow!(
                 "could not find desired target {:?} in the targets for this crate: {:?}",
-                (kind, target),
+                target,
                 targets
             )
         })?;
@@ -243,26 +271,35 @@ fn workload(opt: &Opt, artifacts: &[Artifact]) -> anyhow::Result<Vec<String>> {
         eprintln!("CARGO_PROFILE_{}_DEBUG=true\n", profile.to_uppercase());
     }
 
+    Ok(binary_path.to_path_buf())
+}
+
+fn workload(opt: &Opt, binary_path: Utf8PathBuf) -> anyhow::Result<Vec<String>> {
     let mut command = Vec::with_capacity(1 + opt.trailing_arguments.len());
     command.push(binary_path.to_string());
     command.extend(opt.trailing_arguments.iter().cloned());
     Ok(command)
 }
 
-#[derive(Clone, Debug)]
-struct BinaryTarget {
+#[derive(Debug)]
+struct ValidTarget {
+    category: Category,
     package: String,
-    target: String,
+    name: String,
+    kind: Vec<String>,
 }
 
-impl std::fmt::Display for BinaryTarget {
+impl std::fmt::Display for ValidTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "target {} in package {}", self.target, self.package)
+        write!(f, "target {} in package {}", self.name, self.package)
     }
 }
 
-fn find_unique_target(kind: &[&str]) -> anyhow::Result<BinaryTarget> {
-    let mut targets: Vec<_> = MetadataCommand::new()
+fn load_targets<F>(cat: Category, target_filter: F) -> anyhow::Result<Vec<ValidTarget>>
+where
+    F: FnMut(&ValidTarget) -> bool,
+{
+    Ok(MetadataCommand::new()
         .no_deps()
         .exec()
         .context("failed to access crate metadata")?
@@ -270,27 +307,22 @@ fn find_unique_target(kind: &[&str]) -> anyhow::Result<BinaryTarget> {
         .into_iter()
         .flat_map(|p| {
             let Package { targets, name, .. } = p;
-            targets.into_iter().filter_map(move |t| {
-                t.kind
-                    .iter()
-                    .any(|s| kind.contains(&s.as_str()))
-                    .then(|| BinaryTarget {
-                        package: name.clone(),
-                        target: t.name,
-                    })
+            targets.into_iter().map(move |t| ValidTarget {
+                package: name.clone(),
+                name: t.name,
+                kind: t.kind,
+                category: cat,
             })
         })
-        .collect();
+        .filter(target_filter)
+        .collect())
+}
+
+fn find_unique_target(category: Category) -> anyhow::Result<ValidTarget> {
+    let mut targets = load_targets(category, |t| category.allows_kind(&t.kind))?;
 
     match targets.as_slice() {
-        [_] => {
-            let target = targets.remove(0);
-            eprintln!(
-                "automatically selected {} as it is the only valid target",
-                target
-            );
-            Ok(target)
-        }
+        [_] => Ok(targets.remove(0)),
         [] => Err(anyhow!(
             "crate has no automatically selectable target: try passing `--example <example>` \
                 or similar to choose a binary"
@@ -302,27 +334,41 @@ fn find_unique_target(kind: &[&str]) -> anyhow::Result<BinaryTarget> {
     }
 }
 
+fn verify_target(name: &str, cat: Category, pkg: Option<&str>) -> anyhow::Result<ValidTarget> {
+    let mut targets: Vec<_> = load_targets(cat, |t| {
+        pkg.map_or(true, |p| t.package == p) && t.name == name && cat.allows_kind(&t.kind)
+    })?;
+
+    match targets.as_slice() {
+        [_] => Ok(targets.remove(0)),
+        [] => Err(anyhow!(
+            "workspace does not contain target {} of category {:?}{}",
+            name,
+            cat,
+            pkg.map(|p| format!(" in package {}", p))
+                .unwrap_or_default()
+        )),
+        _ if pkg.is_none() => Err(anyhow!("several possible targets found: {:?}, please try to pass an explict package as well.", targets)),
+        _ => Err(anyhow!("several possible targets found: {:?}, but package, target and target kind combination should be unique.", targets)),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    let Opts::Flamegraph(mut opt) = Opts::from_args();
+    let Opts::Flamegraph(opt) = Opts::from_args();
 
-    if opt.bin.is_none()
-        && opt.bench.is_none()
-        && opt.example.is_none()
-        && opt.test.is_none()
-        && opt.unit_test.is_none()
-    {
-        let BinaryTarget { target, package } = find_unique_target(&["bin"])?;
-        opt.bin = Some(target);
-        opt.package = Some(package);
-    }
-
-    if opt.unit_test == Some(None) {
-        let BinaryTarget { target, package } = find_unique_target(&["bin", "lib"])?;
-        opt.unit_test = Some(Some(target));
-        opt.package = Some(package);
-    }
-
-    let artifacts = build(&opt)?;
-    let workload = workload(&opt, &artifacts)?;
+    let requested_target = RequestedTarget::from(&opt);
+    let target = match requested_target {
+        RequestedTarget::None => find_unique_target(Category::Bin),
+        RequestedTarget::UnitTest(None) => find_unique_target(Category::UnitTest),
+        RequestedTarget::Bench(ref t)
+        | RequestedTarget::Bin(ref t)
+        | RequestedTarget::Example(ref t)
+        | RequestedTarget::Test(ref t)
+        | RequestedTarget::UnitTest(Some(ref t)) => {
+            verify_target(t, requested_target.as_category(), opt.package.as_deref())
+        }
+    }?;
+    let executable = build(&target, &opt)?;
+    let workload = workload(&opt, executable)?;
     flamegraph::generate_flamegraph_for_workload(Workload::Command(workload), opt.graph)
 }
