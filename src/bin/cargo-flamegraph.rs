@@ -289,6 +289,14 @@ struct ValidTarget {
     kind: Vec<String>,
 }
 
+impl ValidTarget {
+    /// Returns true if the package name matches or `package` is None.
+    /// This allows ignoring the package if it's not given explicitly.
+    fn is_in_package(&self, package: Option<&str>) -> bool {
+        package.map_or(true, |p| p == self.package)
+    }
+}
+
 impl std::fmt::Display for ValidTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "target {} in package {}", self.name, self.package)
@@ -318,8 +326,10 @@ where
         .collect())
 }
 
-fn find_unique_target(category: Category) -> anyhow::Result<ValidTarget> {
-    let mut targets = load_targets(category, |t| category.allows_kind(&t.kind))?;
+fn find_unique_target(category: Category, pkg: Option<&str>) -> anyhow::Result<ValidTarget> {
+    let mut targets = load_targets(category, |t| {
+        category.allows_kind(&t.kind) && t.is_in_package(pkg)
+    })?;
 
     match targets.as_slice() {
         [_] => Ok(targets.remove(0)),
@@ -336,7 +346,7 @@ fn find_unique_target(category: Category) -> anyhow::Result<ValidTarget> {
 
 fn verify_target(name: &str, cat: Category, pkg: Option<&str>) -> anyhow::Result<ValidTarget> {
     let mut targets: Vec<_> = load_targets(cat, |t| {
-        pkg.map_or(true, |p| t.package == p) && t.name == name && cat.allows_kind(&t.kind)
+        t.is_in_package(pkg) && t.name == name && cat.allows_kind(&t.kind)
     })?;
 
     match targets.as_slice() {
@@ -357,15 +367,16 @@ fn main() -> anyhow::Result<()> {
     let Opts::Flamegraph(opt) = Opts::from_args();
 
     let requested_target = RequestedTarget::from(&opt);
+    let package = opt.package.as_deref();
     let target = match requested_target {
-        RequestedTarget::None => find_unique_target(Category::Bin),
-        RequestedTarget::UnitTest(None) => find_unique_target(Category::UnitTest),
+        RequestedTarget::None => find_unique_target(Category::Bin, package),
+        RequestedTarget::UnitTest(None) => find_unique_target(Category::UnitTest, package),
         RequestedTarget::Bench(ref t)
         | RequestedTarget::Bin(ref t)
         | RequestedTarget::Example(ref t)
         | RequestedTarget::Test(ref t)
         | RequestedTarget::UnitTest(Some(ref t)) => {
-            verify_target(t, requested_target.as_category(), opt.package.as_deref())
+            verify_target(t, requested_target.as_category(), package)
         }
     }?;
     let executable = build(&target, &opt)?;
