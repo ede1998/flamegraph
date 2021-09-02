@@ -259,9 +259,10 @@ fn build(target: &ValidTarget, opt: &Opt) -> anyhow::Result<Utf8PathBuf> {
 
     const NONE: u32 = 0;
     if !opt.dev && debug_level.unwrap_or(NONE) == NONE {
-        let profile = match opt.bench {
-            Some(_) => "bench",
-            None => "release",
+        let profile = match target.category {
+            Category::Example | Category::Bin => "release",
+            // tests use the bench profile in release mode.
+            Category::UnitTest | Category::Test | Category::Bench => "bench",
         };
 
         eprintln!("\nWARNING: profiling without debuginfo. Enable symbol information by adding the following lines to Cargo.toml:\n");
